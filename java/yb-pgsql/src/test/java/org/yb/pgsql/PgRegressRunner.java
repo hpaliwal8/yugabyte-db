@@ -87,6 +87,33 @@ public class PgRegressRunner {
     return pgRegressOutputDir;
   }
 
+  static File findExpectedFile(List<String> diffLines, File expectedDir, File resultFile)
+      throws IOException {
+    // pg_regress records its chosen expectfile in an unquoted command header. Anchor on the
+    // known directories and result path because either path can contain spaces.
+    Pattern header = Pattern.compile(
+        "^diff .*? (" + Pattern.quote(expectedDir.getAbsolutePath() + File.separator) +
+        ".+) " + Pattern.quote(resultFile.getAbsolutePath()) + "$");
+    Path expectedPath = expectedDir.getCanonicalFile().toPath();
+    File selectedFile = null;
+    for (String line : diffLines) {
+      Matcher matcher = header.matcher(line);
+      if (!matcher.matches()) {
+        continue;
+      }
+      File candidate = new File(matcher.group(1));
+      if (!candidate.getCanonicalFile().toPath().startsWith(expectedPath) ||
+          !candidate.isFile() || !candidate.canRead()) {
+        return null;
+      }
+      if (selectedFile != null && !selectedFile.equals(candidate)) {
+        return null;
+      }
+      selectedFile = candidate;
+    }
+    return selectedFile;
+  }
+
   public void run(ProcessBuilder procBuilder) throws Exception {
     if (diffsFilePath.exists()) {
       diffsFilePath.delete();
@@ -98,6 +125,7 @@ public class PgRegressRunner {
     String  logPrefix       = "pg_regress|pid" + pgRegressPid;
     int     exitCode        = -1;
     long    runtimeMillis;
+    List<String> diffsLines = Collections.emptyList();
 
     try (LogPrinter stdoutLogPrinter =
              new LogPrinter(pgRegressProc.getInputStream(), logPrefix + "|stdout ",
@@ -110,9 +138,13 @@ public class PgRegressRunner {
       runtimeMillis = System.currentTimeMillis() - startTimeMillis;
     } finally {
       if (diffsFilePath.exists()) {
-        List<String> diffsLines = FileUtil.readLinesFrom(diffsFilePath);
-        String diffsContent = StringUtils.join(diffsLines.iterator(), "\n");
-        LOG.warn("Contents of {}:\n{}", diffsFilePath, diffsContent);
+        try {
+          diffsLines = FileUtil.readLinesFrom(diffsFilePath);
+          String diffsContent = StringUtils.join(diffsLines.iterator(), "\n");
+          LOG.warn("Contents of {}:\n{}", diffsFilePath, diffsContent);
+        } catch (IOException ex) {
+          LOG.warn("Unable to read regression diffs from {}", diffsFilePath, ex);
+        }
       } else if (exitCode != 0) {
         LOG.error("File does not exist: {}", diffsFilePath);
       }
@@ -123,8 +155,19 @@ public class PgRegressRunner {
     if (!sortedFailedTests.isEmpty()) {
       LOG.warn("Failed tests: {}", sortedFailedTests);
       for (String testName : sortedFailedTests) {
-        File expectedFile = new File(new File(pgRegressOutputDir, "expected"), testName + ".out");
+        File expectedDir = new File(pgRegressOutputDir, "expected");
         File resultFile = new File(new File(pgRegressOutputDir, "results"), testName + ".out");
+        File expectedFile = null;
+        try {
+          expectedFile = findExpectedFile(diffsLines, expectedDir, resultFile);
+        } catch (IOException ex) {
+          LOG.warn("Unable to resolve selected expected output for {}", testName, ex);
+        }
+        if (expectedFile == null) {
+          expectedFile = new File(expectedDir, testName + ".out");
+          LOG.warn("Could not determine selected expected output for {}; falling back to {}.",
+              testName, expectedFile);
+        }
         if (!expectedFile.exists()) {
           LOG.warn("Expected test output file {} not found.", expectedFile);
           continue;
@@ -133,8 +176,12 @@ public class PgRegressRunner {
           LOG.warn("Actual test output file {} not found.", resultFile);
           continue;
         }
-        LOG.warn("Side-by-side diff between expected output and actual output of {}:\n{}",
-            testName, SideBySideDiff.generate(expectedFile, resultFile));
+        try {
+          LOG.warn("Side-by-side diff between expected output {} and actual output of {}:\n{}",
+              expectedFile, testName, SideBySideDiff.generate(expectedFile, resultFile));
+        } catch (IOException ex) {
+          LOG.warn("Unable to generate side-by-side diff for {}", testName, ex);
+        }
       }
     } else if (exitCode != 0) {
       LOG.error("No failed tests detected!");
